@@ -1,0 +1,113 @@
+# Project-specific contract for normalized synthetic claim lines.
+# This specification is not an implemented validator or an industry standard.
+contract_id: healthcare.claim_line
+contract_version: "1.0.0"
+status: draft
+enforcement_status: not_implemented
+target_table: silver.claim_lines_current
+
+grain: One current full snapshot per payer, claim, and service line.
+primary_key: [payer_id, claim_id, line_number]
+version_key: [payer_id, claim_id, line_number, source_version]
+version_order: source_version
+
+source_semantics:
+  delivery: Incremental full-line snapshots, not payment transactions.
+  ordering: Versions increase per primary key; gaps are allowed.
+  corrections: Replace the complete older snapshot; never add amounts.
+  missing_rows: Absence from an incremental file does not mean deletion.
+  voids: A newer VOIDED snapshot retains the key and removes its reporting contribution.
+  scope: Synthetic USD claims; negative adjustments and recoupment ledgers are out of scope.
+
+field_defaults:
+  nullable: false
+  string_policy: Preserve identifier case and leading zeros; reject blank identifiers.
+  money_policy: Parse exactly to decimal(18,2); reject excess scale or overflow.
+  timestamp_policy: Require a timezone and normalize to UTC.
+
+fields:
+  payer_id: {type: string, enum: [PAYER_A, PAYER_B, PAYER_C]}
+  claim_id: {type: string}
+  line_number: {type: integer, minimum: 1}
+  source_version: {type: long, minimum: 1}
+  member_id: {type: string}
+  provider_id: {type: string}
+  service_start_date: {type: date}
+  service_end_date: {type: date}
+  received_at: {type: timestamp}
+  adjudicated_at: {type: timestamp, nullable: true}
+  source_updated_at: {type: timestamp}
+  status: {type: string, enum: [PENDING, PAID, DENIED, VOIDED]}
+  billed_amount: {type: "decimal(18,2)", minimum: "0.00"}
+  allowed_amount: {type: "decimal(18,2)", minimum: "0.00"}
+  paid_amount: {type: "decimal(18,2)", minimum: "0.00"}
+  currency: {type: string, enum: [USD]}
+
+row_rules:
+  - id: DQ001
+    rule: service_start_date must be on or before service_end_date.
+  - id: DQ002
+    rule: PAID and DENIED require adjudicated_at on or after received_at.
+  - id: DQ003
+    rule: PENDING requires adjudicated_at to be null.
+  - id: DQ004
+    rule: PENDING, DENIED, and VOIDED require paid_amount equal to 0.00.
+  - id: DQ005
+    rule: Member and provider keys must exist in the payer-scoped synthetic reference data.
+
+validation_policy:
+  invalid_row: Preserve raw input and quarantine with rule IDs and source location.
+  invalid_newer_version: Keep prior valid state; expose unresolved rows in run quality metrics.
+  unresolved_required_check: Block publication of the batch.
+  missing_or_renamed_required_column: Block the source file before Silver writes.
+  unexpected_column: Retain in Bronze; require a reviewed mapping before Silver promotion.
+  automatic_schema_evolution: false
+
+merge_policy:
+  conflict_check: Compare equal version keys within the batch and against retained version history.
+  same_version_same_payload: Treat as an exact replay; do not change current state.
+  same_version_different_payload: Quarantine incoming conflicts and block the batch before Silver writes.
+  older_version: Retain history; do not overwrite current state.
+  newer_version: Replace the current snapshot only after validation.
+  source_reduction: Select at most one valid candidate per primary key before MERGE.
+  tie_breaking: Never resolve conflicting versions using ingestion order.
+  lineage_on_replay: Preserve current-row lineage; record the replay as a separate run event.
+
+payload_comparison:
+  fields: All normalized fields listed in this contract; exclude generated lineage.
+  encoding: Sorted-key compact UTF-8 JSON; amounts as two-decimal strings; dates as ISO dates.
+  timestamps: UTC ISO 8601 with six fractional digits and Z; null remains JSON null.
+  integers: Encode as JSON integers.
+  hash: SHA-256 of the canonical encoding, with canonical payload retained for comparison.
+
+required_lineage:
+  - source_file
+  - source_file_sha256
+  - source_record_number
+  - source_batch_id
+  - ingested_at_utc
+  - pipeline_git_commit
+  - contract_version
+
+reporting_policy:
+  input: Current valid snapshots, with unresolved-row counts visible to consumers.
+  paid_total: Sum paid_amount on current PAID lines; never sum across source versions.
+  denial_rate: DENIED line count divided by PAID plus DENIED line count; null if denominator is zero.
+  adjudication_lag: Elapsed hours from received_at to adjudicated_at on current PAID and DENIED lines.
+  claim_count: Count distinct payer_id and claim_id pairs, separately from service-line counts.
+  exclusions: Exclude VOIDED lines from financial and adjudication metrics.
+  reconciliation: Account for every input disposition; source snapshot totals are not additive transactions.
+
+acceptance_scenarios:
+  - "Same claim_id under PAYER_A and PAYER_B remains two independent claims."
+  - "Replaying a completed batch leaves current rows and business totals unchanged."
+  - "PAID version 1 at 80.00 followed by PAID version 2 at 75.00 reports 75.00, not 155.00."
+  - "Version 1 arriving after version 2 cannot overwrite version 2."
+  - "Different payloads for the same version key block the batch; no arbitrary winner."
+  - "A newer VOIDED version removes the previous payment contribution and preserves source history."
+  - "Invalid rows appear in quarantine and quality metrics; they are never silently discarded."
+
+implementation_notes:
+  - "Payer-specific mappings and the executable validator will be added in subsequent steps."
+  - "Version history retention, cross-table recovery, and publication gating require separate implementation."
+  - "These are synthetic feed rules, not universal payer rules or X12/FHIR conformance."
